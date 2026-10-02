@@ -204,7 +204,10 @@ Decided with the field team; revisit only if a customer needs it.
 | `./test.sh IMAGE SECRET_ARN [METHOD]` | the tool for METHOD | The same 51 checks against a real image. IMAGE needs an ENTRYPOINT or CMD. SECRET_ARN can be any ARN-shaped string. |
 | `./linux-test.sh` | Docker | Runs `test.sh` inside an Ubuntu container (installs jq, skopeo, curl, AWS CLI v2). Needs AWS credentials and an ECR image. |
 
-Results so far (51/51 each unless noted):
+Results so far. The suite has grown over time: the macOS six-method and Linux
+container runs below were done when it had 49 checks (49/49 each unless noted).
+Since then it grew to 51 checks, re-run only offline and against a public image
+(both 51/51). The other environments have not been re-run at 51.
 
 | Environment | jq | Result |
 |---|---|---|
