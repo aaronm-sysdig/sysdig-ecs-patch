@@ -3,7 +3,14 @@
 Field tool that instruments a plain ECS Fargate task definition (JSON) with the
 Sysdig Workload Agent. It does what the CloudFormation serverless-patcher does,
 but for pipelines that register task definition JSON directly (GitHub Actions,
-Azure DevOps, CodeBuild, scripts). Not an officially supported Sysdig product.
+Azure DevOps, CodeBuild, scripts).
+
+> **Proof of concept, provided as is.** This is a personal field tool written to
+> prove out a task. It is **not an official Sysdig product**, is **not supported
+> by Sysdig**, and comes with **no warranty of any kind** (see the Apache-2.0
+> [LICENSE](LICENSE)). Review it, test it in a non-production account first, and
+> use it at your own risk. Behaviour was verified only as described under
+> [Testing](#testing).
 
 Single bash script. Requirements: `bash`, `jq`, plus the tool for the lookup
 method you pick.
