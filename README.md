@@ -83,6 +83,23 @@ Multi-arch: the architecture comes from the task definition `runtimePlatform`
 IAM for the `ecr` method: `ecr:GetAuthorizationToken` is not needed, but
 `ecr:BatchGetImage` and `ecr:GetDownloadUrlForLayer` are.
 
+## What happens for each kind of container
+
+The tool works out what the container would run today (task definition values win,
+anything unset comes from the image), then wraps it: `entryPoint: [instrument]`,
+`command: [<original entrypoint> + <original command>]`. The image used for the
+examples has `ENTRYPOINT [/docker-entrypoint.sh]` and `CMD [nginx -g 'daemon off;']`.
+
+| Container in the task definition | Treated as | Image looked up? |
+|---|---|---|
+| neither `entryPoint` nor `command` | image ENTRYPOINT + image CMD | yes |
+| `entryPoint` only | that `entryPoint` alone (ECS drops the image CMD) | no |
+| `command` only | image ENTRYPOINT + that `command` | yes |
+| both | `entryPoint` + `command` as written | no |
+| already starts with `instrument` | left untouched | no |
+
+All of these are covered by `./test-offline.sh`.
+
 ## Mirroring the agent image, priority and sidecar resources
 
 - `--workload-agent-image IMAGE` (alias `--agent-image`) sets the sidecar image,
@@ -162,9 +179,12 @@ Decided with the field team; revisit only if a customer needs it.
     GitHub Actions render-task-definition step, or an Azure DevOps token
     replacement), and before the register/deploy step.
   - Image names that are still placeholders (`${REPO}:tag`) are rejected.
-- **Not a reconciler.** Containers that already start with the instrument
-  entrypoint are left untouched, and an existing sidecar is kept as is. Run it on
-  the vanilla definition each time (the normal pipeline shape), not on its own output.
+- **Already-instrumented containers are skipped, not updated.** A container whose
+  `entryPoint` already starts with `/opt/draios/bin/instrument` is left exactly as
+  it is, and an existing `SysdigInstrumentation` sidecar is kept as is. Changing the
+  collector, priority or env on a task that is already instrumented therefore means
+  starting again from the vanilla definition. (Containers that merely have their own
+  `entryPoint` and/or `command` are NOT skipped; see the table above.)
 - **Lookups are not retried.** A registry blip fails the run, which is the safe
   outcome. Re-run the step.
 - **Credentials:** the tool assumes the runner already has registry and AWS access.

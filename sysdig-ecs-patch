@@ -402,7 +402,8 @@ while IFS= read -r line; do
   fi
 
   ep_len=$(jq 'length' <<<"$td_ep"); cmd_len=$(jq 'length' <<<"$td_cmd")
-  if [ "$ep_len" -gt 0 ] && [ "$cmd_len" -gt 0 ]; then
+  if [ "$ep_len" -gt 0 ]; then
+    # entryPoint set: ECS discards the image CMD, so the image is not needed at all
     orig=$(jq -c -n --argjson a "$td_ep" --argjson b "$td_cmd" '$a + $b')
     src="task definition"
   else
