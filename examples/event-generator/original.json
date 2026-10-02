@@ -1,0 +1,130 @@
+{
+  "containerDefinitions": [
+    {
+      "name": "SysdigInstrumentation",
+      "image": "quay.io/sysdig/workload-agent:6.2.1",
+      "cpu": 0,
+      "portMappings": [],
+      "essential": true,
+      "environment": [
+        {
+          "name": "SYSDIG_COLLECTOR",
+          "value": "ingest.au1.sysdig.com"
+        },
+        {
+          "name": "SYSDIG_EXTRA_CONF",
+          "value": ""
+        },
+        {
+          "name": "SYSDIG_PRIORITY",
+          "value": "availability"
+        },
+        {
+          "name": "SYSDIG_SIDECAR",
+          "value": "auto"
+        },
+        {
+          "name": "SYSDIG_COLLECTOR_PORT",
+          "value": "6443"
+        }
+      ],
+      "mountPoints": [],
+      "volumesFrom": [],
+      "secrets": [
+        {
+          "name": "SYSDIG_ACCESS_KEY",
+          "valueFrom": "arn:aws:secretsmanager:ap-southeast-2:111122223333:secret:sysdig-access-key-AbCdEf"
+        }
+      ],
+      "logConfiguration": {
+        "logDriver": "awslogs",
+        "options": {
+          "awslogs-group": "SysdigFargate-Workload-Instrumentation-SysdigLogGroup-EXAMPLE",
+          "awslogs-region": "ap-southeast-2",
+          "awslogs-stream-prefix": "TaskDefinition"
+        }
+      },
+      "systemControls": []
+    },
+    {
+      "name": "syscall-RunShellUntrusted",
+      "image": "falcosecurity/event-generator:main",
+      "cpu": 0,
+      "portMappings": [],
+      "essential": true,
+      "entryPoint": [
+        "/opt/draios/bin/instrument"
+      ],
+      "command": [
+        "/usr/bin/event-generator",
+        "run",
+        "syscall.RunShellUntrusted",
+        "--loop",
+        "--sleep",
+        "60s"
+      ],
+      "environment": [
+        {
+          "name": "SYSDIG_SIDECAR",
+          "value": "auto"
+        },
+        {
+          "name": "SYSDIG_LOGGING",
+          "value": "info"
+        },
+        {
+          "name": "SYSDIG_EXTRA_CONF",
+          "value": "tags: cluster:extra-conf-cluster-secret,environment:extra-conf-environment-secret"
+        }
+      ],
+      "mountPoints": [],
+      "volumesFrom": [
+        {
+          "sourceContainer": "SysdigInstrumentation",
+          "readOnly": true
+        }
+      ],
+      "linuxParameters": {
+        "capabilities": {
+          "add": [
+            "SYS_PTRACE"
+          ],
+          "drop": []
+        }
+      },
+      "logConfiguration": {
+        "logDriver": "awslogs",
+        "options": {
+          "awslogs-group": "/ecs/Syscall-RunShellUntrusted",
+          "awslogs-region": "ap-southeast-2",
+          "awslogs-stream-prefix": "app"
+        }
+      },
+      "healthCheck": {
+        "command": [
+          "CMD-SHELL",
+          "/usr/bin/event-generator list"
+        ],
+        "interval": 30,
+        "timeout": 5,
+        "retries": 3
+      },
+      "systemControls": []
+    }
+  ],
+  "family": "example-event-generator-instrumented",
+  "executionRoleArn": "arn:aws:iam::111122223333:role/ecsTaskExecutionRole",
+  "networkMode": "awsvpc",
+  "volumes": [],
+  "placementConstraints": [],
+  "runtimePlatform": {
+    "cpuArchitecture": "X86_64",
+    "operatingSystemFamily": "LINUX"
+  },
+  "requiresCompatibilities": [
+    "FARGATE"
+  ],
+  "cpu": "256",
+  "memory": "512",
+  "pidMode": "task"
+}

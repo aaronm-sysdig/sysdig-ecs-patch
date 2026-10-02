@@ -1,0 +1,523 @@
+#!/usr/bin/env bash
+# sysdig-ecs-patch
+# SPDX-License-Identifier: Apache-2.0
+#
+# Instrument an ECS Fargate task definition (plain JSON) with the Sysdig
+# Workload Agent, for pipelines that do not use the CloudFormation macro.
+# Example/field tool, not an officially supported Sysdig product.
+#
+# Requires: bash, jq, and the tool for the chosen --method.
+
+set -euo pipefail
+
+VERSION="0.1.0"
+INSTRUMENT="/opt/draios/bin/instrument"
+SIDECAR_NAME="SysdigInstrumentation"
+METHODS="auto skopeo crane regctl ecr dockerinspect buildx none"
+
+usage() {
+  cat <<'EOF'
+Usage:
+  sysdig-ecs-patch --input FILE [--output FILE] [--method METHOD] \
+      --collector HOST --access-key-secret-arn ARN [options]
+
+Rewrites an ECS task definition so every container runs under Sysdig
+instrumentation and adds the SysdigInstrumentation sidecar. If a container
+does not set entryPoint/command in the task definition, the values baked into
+its image are looked up with the chosen method and written into the task
+definition (ECS drops the image CMD when only entryPoint is overridden, so
+both must be explicit).
+
+Required:
+  -i, --input FILE              Task definition JSON, or - for stdin. Accepts the
+                                output of `aws ecs describe-task-definition`.
+      --collector HOST          Sysdig collector, e.g. ingest.au1.sysdig.com
+      --access-key-secret-arn ARN
+                                Secrets Manager or SSM ARN holding the access key
+
+Output:
+  -o, --output FILE             Write here. Use - for stdout. If omitted, the
+                                input file is edited in place.
+      --backup                  With in-place editing, keep FILE.bak
+
+Image lookup:
+  -m, --method METHOD          How to read ENTRYPOINT/CMD from images (default: auto)
+        auto           first usable of: skopeo, crane, regctl, ecr, dockerinspect
+        skopeo         skopeo inspect --config (ECR login handled automatically)
+        crane          crane config (needs registry login done beforehand)
+        regctl         regctl image config (needs registry login done beforehand)
+        ecr            AWS CLI only (+ curl), private ECR images only
+        dockerinspect  docker image inspect (pulls the image if not local)
+        buildx         docker buildx imagetools inspect
+        none           never look anything up; fail if a container does not set
+                       both entryPoint and command in the task definition
+      --arch ARCH               amd64 or arm64. Default: from the task
+                                definition runtimePlatform, else amd64.
+
+Agent options:
+      --collector-port PORT     Default 6443
+      --workload-agent-image IMAGE
+                                Sysdig workload agent image for the sidecar. Use this
+                                to point at an internal mirror. Alias: --agent-image.
+                                Default quay.io/sysdig/workload-agent:latest
+      --sidecar-cpu UNITS       CPU units reserved for the sidecar (default: none)
+      --sidecar-memory MIB      Hard memory limit for the sidecar (default: none)
+      --sidecar-memory-reservation MIB
+                                Soft memory reservation for the sidecar (default: none)
+      --priority MODE           availability (default) or security
+      --skip NAME               Leave this container alone (repeatable)
+      --sidecar-essential V     true, false or auto (default auto: true only for
+                                priority security, matching Sysdig's template)
+      --sidecar-env NAME=VALUE  Extra env var on the sidecar (repeatable), e.g.
+                                SYSDIG_LOGGING=debug
+      --workload-env NAME=VALUE Extra env var on every instrumented container
+                                (repeatable), e.g. SYSDIG_LOGGING=info or
+                                SYSDIG_EXTRA_CONF='tags: team:payments'
+      --log-group NAME          Send sidecar logs to this CloudWatch log group
+      --log-region REGION       Region for --log-group (default $AWS_REGION)
+      --log-stream-prefix NAME  Stream prefix for --log-group (default sysdig)
+
+Other:
+  -n, --dry-run                 Do everything (lookups, warnings) but write nothing.
+                                Prints a diff of what would change, and creates no
+                                output file and no backup.
+      --list-original           Only show what each container runs today, then exit
+  -h, --help                    Show this help
+  -V, --version                 Show version
+
+With no sidecar CPU/memory set, the agent shares the task's CPU and memory with
+the customer's containers. The tool warns about this and checks that any values
+you set fit inside the task size.
+
+Environment defaults: SYSDIG_COLLECTOR, SYSDIG_COLLECTOR_PORT,
+SYSDIG_ACCESS_KEY_SECRET_ARN, SYSDIG_WORKLOAD_AGENT_IMAGE, SYSDIG_PRIORITY.
+
+Examples:
+  # 1. Look first. See what each container runs today, then preview the full change
+  sysdig-ecs-patch -i taskdef.json --list-original -m skopeo
+  sysdig-ecs-patch -i taskdef.json --dry-run -m skopeo \
+      --collector ingest.au1.sysdig.com --access-key-secret-arn arn:aws:secretsmanager:...
+
+  # 2. Write a new file, reading image config with skopeo
+  sysdig-ecs-patch -i taskdef.json -o taskdef-sysdig.json -m skopeo \
+      --collector ingest.au1.sysdig.com \
+      --access-key-secret-arn arn:aws:secretsmanager:ap-southeast-2:111122223333:secret:sysdig-key
+
+  # 3. Edit in place (no --output), keep taskdef.json.bak, use docker inspect
+  #    (good when the image was just built on this agent)
+  sysdig-ecs-patch -i taskdef.json -m dockerinspect --backup \
+      --collector ingest.au1.sysdig.com --access-key-secret-arn arn:aws:secretsmanager:...
+
+  # 4. Private ECR with nothing extra installed (AWS CLI + curl only)
+  sysdig-ecs-patch -i taskdef.json -o out.json -m ecr \
+      --collector ingest.au1.sysdig.com --access-key-secret-arn arn:aws:secretsmanager:...
+
+  # 5. Internal mirror of the agent image, ARM64 tasks, security mode with
+  #    dedicated sidecar resources
+  sysdig-ecs-patch -i taskdef.json -o out.json -m crane --arch arm64 \
+      --workload-agent-image 111122223333.dkr.ecr.ap-southeast-2.amazonaws.com/sysdig/workload-agent:6.3.0 \
+      --priority security --sidecar-cpu 128 --sidecar-memory 256 \
+      --collector ingest.au1.sysdig.com --access-key-secret-arn arn:aws:secretsmanager:...
+
+  # 6. Straight from AWS to AWS: read the current task definition, patch it, register it
+  aws ecs describe-task-definition --task-definition my-app \
+    | sysdig-ecs-patch -i - -m ecr \
+        --collector ingest.au1.sysdig.com --access-key-secret-arn arn:aws:secretsmanager:... \
+    > patched.json
+  aws ecs register-task-definition --cli-input-json file://patched.json
+
+  # 7. Extra Sysdig settings from real task definitions.
+  #    --workload-env goes on every instrumented container, --sidecar-env on the
+  #    SysdigInstrumentation sidecar. Values are NAME=VALUE; everything after the
+  #    first '=' is the value, so spaces, commas, ':' and newlines are fine.
+  #    Container tags and logging level on the workload:
+  sysdig-ecs-patch -i taskdef.json -o out.json -m skopeo \
+      --workload-env SYSDIG_LOGGING=info \
+      --workload-env 'SYSDIG_EXTRA_CONF=tags: cluster:extra-conf-cluster,environment:extra-conf-environment' \
+      --collector ingest.au1.sysdig.com --access-key-secret-arn arn:aws:secretsmanager:...
+
+  # 7b. Agent behind an HTTP proxy, plus tags (multi-line YAML via bash $'...'),
+  #     on the sidecar only. Same shape as Sysdig-Fargate-Test-Workload-Direct:6.
+  sysdig-ecs-patch -i taskdef.json -o out.json -m skopeo \
+      --sidecar-env $'SYSDIG_EXTRA_CONF=http_proxy:\n  proxy_host: proxy.corp.example.com\n  proxy_port: 3128\ntags:\n  platform:dhp,owner:comsec' \
+      --collector ingest.au1.sysdig.com --access-key-secret-arn arn:aws:secretsmanager:...
+
+  # 7c. Everything together: essential sidecar, sidecar logs, extra settings
+  sysdig-ecs-patch -i taskdef.json -o out.json -m skopeo \
+      --sidecar-essential true \
+      --log-group /ecs/sysdig-agent --log-region ap-southeast-2 --log-stream-prefix TaskDefinition \
+      --sidecar-env SYSDIG_EXTRA_CONF= \
+      --workload-env SYSDIG_LOGGING=info \
+      --collector ingest.au1.sysdig.com --access-key-secret-arn arn:aws:secretsmanager:...
+
+  # 8. No lookups at all: every container must already set entryPoint and command
+  sysdig-ecs-patch -i taskdef.json -o out.json -m none \
+      --collector ingest.au1.sysdig.com --access-key-secret-arn arn:aws:secretsmanager:...
+
+  # 9. Leave one container alone (for example a log router)
+  sysdig-ecs-patch -i taskdef.json -o out.json -m skopeo --skip log_router \
+      --collector ingest.au1.sysdig.com --access-key-secret-arn arn:aws:secretsmanager:...
+
+Exit status: 0 success, 1 failed (lookup, input or write problem), 2 bad usage.
+EOF
+}
+
+log() { echo "$*" >&2; }
+die() { echo "ERROR: $*" >&2; exit 1; }
+die_usage() { echo "ERROR: $*" >&2; echo >&2; usage >&2; exit 2; }
+
+# ---------------------------------------------------------------- arguments
+INPUT=""; OUTPUT=""; METHOD="auto"; ARCH_OVERRIDE=""; BACKUP=0; LIST_ONLY=0; DRY_RUN=0
+COLLECTOR="${SYSDIG_COLLECTOR:-}"
+COLLECTOR_PORT="${SYSDIG_COLLECTOR_PORT:-6443}"
+SECRET_ARN="${SYSDIG_ACCESS_KEY_SECRET_ARN:-}"
+AGENT_IMAGE="${SYSDIG_WORKLOAD_AGENT_IMAGE:-quay.io/sysdig/workload-agent:latest}"
+PRIORITY="${SYSDIG_PRIORITY:-availability}"
+LOG_GROUP=""; LOG_REGION="${AWS_REGION:-${AWS_DEFAULT_REGION:-}}"
+SIDECAR_CPU=""; SIDECAR_MEM=""; SIDECAR_MEMRES=""
+SIDECAR_ESSENTIAL="auto"; LOG_PREFIX="sysdig"
+SENV='[]'; WENV='[]'
+SKIP=()
+
+add_env() {  # json-array NAME=VALUE option-name
+  local name value
+  [[ "$2" == *=* ]] || { echo "ERROR: $3 expects NAME=VALUE, got: $2" >&2; echo >&2; usage >&2; return 1; }
+  name="${2%%=*}"; value="${2#*=}"
+  [[ "$name" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] || { echo "ERROR: $3: invalid variable name: $name" >&2; echo >&2; usage >&2; return 1; }
+  command -v jq >/dev/null 2>&1 || { echo "ERROR: jq is required but not found." >&2; return 1; }
+  jq -c --arg n "$name" --arg v "$value" '. + [{name:$n, value:$v}]' <<<"$1"
+}
+
+need_val() { [ $# -ge 2 ] && [ -n "${2:-}" ] || die_usage "option $1 needs a value"; }
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -h|--help) usage; exit 0 ;;
+    -V|--version) echo "sysdig-ecs-patch $VERSION"; exit 0 ;;
+    -i|--input) need_val "$@"; INPUT="$2"; shift 2 ;;
+    -o|--output) need_val "$@"; OUTPUT="$2"; shift 2 ;;
+    -m|--method) need_val "$@"; METHOD="$2"; shift 2 ;;
+    --arch) need_val "$@"; ARCH_OVERRIDE="$2"; shift 2 ;;
+    --collector) need_val "$@"; COLLECTOR="$2"; shift 2 ;;
+    --collector-port) need_val "$@"; COLLECTOR_PORT="$2"; shift 2 ;;
+    --access-key-secret-arn) need_val "$@"; SECRET_ARN="$2"; shift 2 ;;
+    --workload-agent-image|--agent-image) need_val "$@"; AGENT_IMAGE="$2"; shift 2 ;;
+    --sidecar-cpu) need_val "$@"; SIDECAR_CPU="$2"; shift 2 ;;
+    --sidecar-memory) need_val "$@"; SIDECAR_MEM="$2"; shift 2 ;;
+    --sidecar-memory-reservation) need_val "$@"; SIDECAR_MEMRES="$2"; shift 2 ;;
+    --priority) need_val "$@"; PRIORITY="$2"; shift 2 ;;
+    --skip) need_val "$@"; SKIP+=("$2"); shift 2 ;;
+    --log-group) need_val "$@"; LOG_GROUP="$2"; shift 2 ;;
+    --log-region) need_val "$@"; LOG_REGION="$2"; shift 2 ;;
+    --log-stream-prefix) need_val "$@"; LOG_PREFIX="$2"; shift 2 ;;
+    --sidecar-essential) need_val "$@"; SIDECAR_ESSENTIAL="$2"; shift 2 ;;
+    --sidecar-env) need_val "$@"; SENV=$(add_env "$SENV" "$2" "$1") || exit 2; shift 2 ;;
+    --workload-env) need_val "$@"; WENV=$(add_env "$WENV" "$2" "$1") || exit 2; shift 2 ;;
+    --backup) BACKUP=1; shift ;;
+    --list-original) LIST_ONLY=1; shift ;;
+    -n|--dry-run) DRY_RUN=1; shift ;;
+    --) shift; break ;;
+    -*) die_usage "unknown option: $1" ;;
+    *) die_usage "unexpected argument: $1" ;;
+  esac
+done
+[ $# -eq 0 ] || die_usage "unexpected argument: $1"
+
+# METHOD aliases
+case "$METHOD" in docker) METHOD="dockerinspect" ;; esac
+
+[ -n "$INPUT" ] || die_usage "--input is required"
+[[ " $METHODS " == *" $METHOD "* ]] || die_usage "unknown method '$METHOD' (choose one of: $METHODS)"
+case "$SIDECAR_ESSENTIAL" in true|false|auto) ;; *) die_usage "--sidecar-essential must be true, false or auto" ;; esac
+case "$PRIORITY" in availability|security) ;; *) die_usage "--priority must be availability or security" ;; esac
+case "${ARCH_OVERRIDE:-amd64}" in amd64|arm64) ;; *) die_usage "--arch must be amd64 or arm64" ;; esac
+[[ "$COLLECTOR_PORT" =~ ^[0-9]+$ ]] || die_usage "--collector-port must be a number"
+for pair in "--sidecar-cpu:$SIDECAR_CPU" "--sidecar-memory:$SIDECAR_MEM" "--sidecar-memory-reservation:$SIDECAR_MEMRES"; do
+  v="${pair#*:}"
+  [ -z "$v" ] || { [[ "$v" =~ ^[0-9]+$ ]] && [ "$v" -gt 0 ]; } || die_usage "${pair%%:*} must be a positive whole number"
+done
+if [ -n "$SIDECAR_MEM" ] && [ -n "$SIDECAR_MEMRES" ] && [ "$SIDECAR_MEMRES" -gt "$SIDECAR_MEM" ]; then
+  die_usage "--sidecar-memory-reservation cannot exceed --sidecar-memory"
+fi
+if [ "$LIST_ONLY" -eq 0 ]; then
+  [ -n "$COLLECTOR" ] || die_usage "--collector is required"
+  [ -n "$SECRET_ARN" ] || die_usage "--access-key-secret-arn is required"
+  [[ "$SECRET_ARN" == arn:* ]] || die_usage "--access-key-secret-arn must be an ARN"
+fi
+if [ -n "$LOG_GROUP" ] && [ -z "$LOG_REGION" ]; then
+  die_usage "--log-group needs --log-region (or AWS_REGION set)"
+fi
+if [ "$INPUT" != "-" ]; then
+  [ -f "$INPUT" ] || die "input file not found: $INPUT"
+else
+  [ -n "$OUTPUT" ] || OUTPUT="-"
+fi
+
+# ---------------------------------------------------------------- tool checks
+have() { command -v "$1" >/dev/null 2>&1; }
+
+have jq || die "jq is required but not found. Install it (e.g. 'apt-get install jq', 'brew install jq', or download the single static binary from https://github.com/jqlang/jq/releases)."
+
+is_ecr() { [[ "$1" =~ ^[0-9]+\.dkr\.ecr(-fips)?\.[a-z0-9-]+\.amazonaws\.com(\.cn)?/ ]]; }
+ecr_region() { echo "${1%%/*}" | sed -E 's/^[0-9]+\.dkr\.ecr(-fips)?\.([a-z0-9-]+)\.amazonaws\.com.*/\2/'; }
+
+# ---------------------------------------------------------------- lookups
+# Each lookup prints {"ep":[...],"cmd":[...]} for one image and architecture.
+
+NORM_CONFIG='{ep:(.config.Entrypoint // []), cmd:(.config.Cmd // [])}'
+
+lookup_skopeo() {
+  local img="$1" arch="$2" args pw
+  args=(inspect --config --override-os linux --override-arch "$arch")
+  if is_ecr "$img"; then
+    have aws || die "skopeo method needs the aws CLI for ECR images"
+    pw=$(aws ecr get-login-password --region "$(ecr_region "$img")") || die "ECR login failed"
+    args+=(--creds "AWS:$pw")
+  fi
+  skopeo "${args[@]}" "docker://$img" | jq -c "$NORM_CONFIG"
+}
+
+lookup_crane() {
+  crane config --platform "linux/$2" "$1" | jq -c "$NORM_CONFIG"
+}
+
+lookup_regctl() {
+  regctl image config --platform "linux/$2" "$1" | jq -c "$NORM_CONFIG"
+}
+
+lookup_dockerinspect() {
+  local img="$1" arch="$2" have_arch=""
+  have_arch=$(docker image inspect "$img" --format '{{.Architecture}}' 2>/dev/null || true)
+  if [ "$have_arch" != "$arch" ]; then
+    log "  docker: pulling $img for linux/$arch"
+    docker pull --platform "linux/$arch" "$img" >&2 || die "docker pull failed for $img"
+  fi
+  docker image inspect "$img" --format '{{json .Config}}' | jq -c '{ep:(.Entrypoint // []), cmd:(.Cmd // [])}'
+}
+
+lookup_buildx() {
+  local img="$1" arch="$2"
+  docker buildx imagetools inspect "$img" --format '{{json .Image}}' |
+    jq -c --arg p "linux/$arch" \
+      'if has("config") then . else .[$p] end
+       | if . == null then error("no linux/" + ($p|sub("linux/";"")) + " image in manifest list") else . end
+       | '"$NORM_CONFIG"
+}
+
+lookup_ecr() {
+  local img="$1" arch="$2" host rest repo ref region regid idarg manifest dgst cdgst url
+  is_ecr "$img" || die "ecr method only works for private ECR images, not: $img"
+  host="${img%%/*}"; rest="${img#*/}"
+  region=$(ecr_region "$img"); regid="${host%%.*}"
+  ref=""
+  if [[ "$rest" == *@* ]]; then ref="imageDigest=${rest#*@}"; rest="${rest%@*}"; fi
+  if [[ "${rest##*/}" == *:* ]]; then
+    [ -n "$ref" ] || ref="imageTag=${rest##*:}"
+    repo="${rest%:*}"
+  else
+    repo="$rest"; [ -n "$ref" ] || ref="imageTag=latest"
+  fi
+  local mt='application/vnd.oci.image.index.v1+json application/vnd.oci.image.manifest.v1+json application/vnd.docker.distribution.manifest.v2+json application/vnd.docker.distribution.manifest.list.v2+json'
+  # shellcheck disable=SC2086
+  manifest=$(aws ecr batch-get-image --region "$region" --registry-id "$regid" --repository-name "$repo" \
+    --image-ids "$ref" --accepted-media-types $mt --query 'images[0].imageManifest' --output text) ||
+    die "ecr batch-get-image failed for $img"
+  [ -n "$manifest" ] && [ "$manifest" != "None" ] || die "image not found in ECR: $img"
+  if jq -e 'has("manifests")' >/dev/null <<<"$manifest"; then
+    dgst=$(jq -r --arg a "$arch" '[.manifests[] | select(.platform.os=="linux" and .platform.architecture==$a)][0].digest // empty' <<<"$manifest")
+    [ -n "$dgst" ] || die "no linux/$arch image in manifest list for $img"
+    # shellcheck disable=SC2086
+    manifest=$(aws ecr batch-get-image --region "$region" --registry-id "$regid" --repository-name "$repo" \
+      --image-ids "imageDigest=$dgst" --accepted-media-types $mt --query 'images[0].imageManifest' --output text) ||
+      die "ecr batch-get-image failed for $repo@$dgst"
+  fi
+  cdgst=$(jq -r '.config.digest // empty' <<<"$manifest")
+  [ -n "$cdgst" ] || die "could not find config digest in manifest for $img"
+  url=$(aws ecr get-download-url-for-layer --region "$region" --registry-id "$regid" --repository-name "$repo" \
+    --layer-digest "$cdgst" --query downloadUrl --output text) || die "ecr get-download-url-for-layer failed"
+  curl -fsSL "$url" | jq -c "$NORM_CONFIG"
+}
+
+pick_method() {
+  local m
+  if [ "$METHOD" != "auto" ]; then echo "$METHOD"; return; fi
+  for m in skopeo crane regctl; do have "$m" && { echo "$m"; return; }; done
+  if have aws && have curl; then echo ecr; return; fi
+  have docker && { echo dockerinspect; return; }
+  echo none
+}
+
+check_method_tools() {
+  case "$1" in
+    skopeo|crane|regctl) have "$1" || die "method '$1' selected but '$1' is not installed" ;;
+    ecr) have aws || die "method 'ecr' needs the aws CLI"; have curl || die "method 'ecr' needs curl" ;;
+    dockerinspect|buildx) have docker || die "method '$1' needs docker" ;;
+  esac
+}
+
+lookup() {  # image arch
+  local out
+  case "$ACTIVE_METHOD" in
+    skopeo) out=$(lookup_skopeo "$1" "$2") ;;
+    crane) out=$(lookup_crane "$1" "$2") ;;
+    regctl) out=$(lookup_regctl "$1" "$2") ;;
+    ecr) out=$(lookup_ecr "$1" "$2") ;;
+    dockerinspect) out=$(lookup_dockerinspect "$1" "$2") ;;
+    buildx) out=$(lookup_buildx "$1" "$2") ;;
+    none) die "container image '$1' needs a lookup but --method none was given. Set both entryPoint and command in the task definition, or choose a lookup method." ;;
+  esac
+  [ -n "$out" ] || die "lookup returned nothing for $1"
+  echo "$out"
+}
+
+# ---------------------------------------------------------------- read input
+if [ "$INPUT" = "-" ]; then JSON=$(cat); else JSON=$(cat "$INPUT"); fi
+jq -e . >/dev/null 2>&1 <<<"$JSON" || die "input is not valid JSON"
+JSON=$(jq 'if (type=="object" and has("taskDefinition")) then .taskDefinition else . end' <<<"$JSON")
+jq -e '.containerDefinitions | type == "array" and length > 0' >/dev/null 2>&1 <<<"$JSON" ||
+  die "input has no containerDefinitions - is it a task definition?"
+
+if [ -n "$ARCH_OVERRIDE" ]; then ARCH="$ARCH_OVERRIDE"
+else ARCH=$(jq -r 'if .runtimePlatform.cpuArchitecture == "ARM64" then "arm64" else "amd64" end' <<<"$JSON"); fi
+
+ACTIVE_METHOD=$(pick_method)
+check_method_tools "$ACTIVE_METHOD"
+log "method: $ACTIVE_METHOD   arch: linux/$ARCH"
+
+# ---------------------------------------------------------------- work out originals
+ORIG='{}'
+SUMMARY=""
+while IFS= read -r line; do
+  name=$(jq -r '.name' <<<"$line")
+  image=$(jq -r '.image' <<<"$line")
+  td_ep=$(jq -c '.ep' <<<"$line")
+  td_cmd=$(jq -c '.cmd' <<<"$line")
+
+  [ "$name" != "$SIDECAR_NAME" ] || continue
+  skipped=0
+  for s in ${SKIP[@]+"${SKIP[@]}"}; do [ "$s" != "$name" ] || skipped=1; done
+  if [ "$skipped" -eq 1 ]; then log "$name: skipped (--skip)"; continue; fi
+  if [ "$(jq -r '.[0] // ""' <<<"$td_ep")" = "$INSTRUMENT" ]; then
+    log "$name: already instrumented, leaving as is"; continue
+  fi
+
+  ep_len=$(jq 'length' <<<"$td_ep"); cmd_len=$(jq 'length' <<<"$td_cmd")
+  if [ "$ep_len" -gt 0 ] && [ "$cmd_len" -gt 0 ]; then
+    orig=$(jq -c -n --argjson a "$td_ep" --argjson b "$td_cmd" '$a + $b')
+    src="task definition"
+  else
+    case "$image" in
+      *'$'*|*'{'*|*'}'*|"") die "$name: image '$image' is not a plain string, cannot look it up. Resolve it first or set entryPoint and command explicitly." ;;
+    esac
+    log "$name: looking up $image"
+    cfg=$(lookup "$image" "$ARCH")
+    # ECS/Docker semantics: overriding entryPoint discards the image CMD.
+    orig=$(jq -c -n --argjson cfg "$cfg" --argjson ep "$td_ep" --argjson cmd "$td_cmd" '
+      (if ($ep|length) > 0 then $ep else $cfg.ep end)
+      + (if ($cmd|length) > 0 then $cmd elif ($ep|length) > 0 then [] else $cfg.cmd end)')
+    src="image + task definition"
+  fi
+  [ "$(jq 'length' <<<"$orig")" -gt 0 ] ||
+    die "$name: no entrypoint or command in the task definition or the image, nothing to wrap"
+  ORIG=$(jq -c --arg n "$name" --argjson o "$orig" '.[$n] = $o' <<<"$ORIG")
+  SUMMARY="${SUMMARY}  $name ($src): $orig"$'\n'
+done < <(jq -c '.containerDefinitions[] | {name, image, ep:(.entryPoint // []), cmd:(.command // [])}' <<<"$JSON")
+
+if [ "$LIST_ONLY" -eq 1 ]; then
+  echo "Original entrypoint + command per container (arch linux/$ARCH):"
+  if [ -n "$SUMMARY" ]; then printf '%s' "$SUMMARY"; else echo "  (none to instrument)"; fi
+  exit 0
+fi
+[ "$ORIG" != "{}" ] || log "note: no containers to instrument (all skipped or already instrumented)"
+[ -z "$SUMMARY" ] || { log "original commands:"; printf '%s' "$SUMMARY" >&2; }
+
+# ---------------------------------------------------------------- build output
+RESULT=$(jq \
+  --argjson orig "$ORIG" \
+  --arg instr "$INSTRUMENT" --arg sc "$SIDECAR_NAME" --arg prio "$PRIORITY" \
+  --arg collector "$COLLECTOR" --arg port "$COLLECTOR_PORT" --arg secret "$SECRET_ARN" \
+  --arg agent "$AGENT_IMAGE" --arg lg "$LOG_GROUP" --arg lr "$LOG_REGION" \
+  --arg scpu "$SIDECAR_CPU" --arg smem "$SIDECAR_MEM" --arg sres "$SIDECAR_MEMRES" \
+  --arg lp "$LOG_PREFIX" --arg ess "$SIDECAR_ESSENTIAL" \
+  --argjson senv "$SENV" --argjson wenv "$WENV" '
+  def merge_env($extra): (. // [])
+      | map(select(.name as $n | ($extra | map(.name) | index($n)) | not)) + $extra;
+  ({
+     name: $sc,
+     image: $agent,
+     essential: (if $ess == "auto" then ($prio == "security") else ($ess == "true") end),
+     environment: ([
+       {name:"SYSDIG_COLLECTOR", value:$collector},
+       {name:"SYSDIG_COLLECTOR_PORT", value:$port},
+       {name:"SYSDIG_SIDECAR", value:"auto"},
+       {name:"SYSDIG_PRIORITY", value:$prio}
+     ] | merge_env($senv)),
+     secrets: [{name:"SYSDIG_ACCESS_KEY", valueFrom:$secret}]
+   }
+   + (if $scpu != "" then {cpu: ($scpu | tonumber)} else {} end)
+   + (if $smem != "" then {memory: ($smem | tonumber)} else {} end)
+   + (if $sres != "" then {memoryReservation: ($sres | tonumber)} else {} end)
+   + (if $lg != "" then {logConfiguration:{logDriver:"awslogs",
+        options:{"awslogs-group":$lg,"awslogs-region":$lr,"awslogs-stream-prefix":$lp}}} else {} end)
+  ) as $sidecar
+  | .containerDefinitions |= map(
+      if $orig[.name] then
+        .entryPoint = [$instr]
+        | .command = $orig[.name]
+        | .volumesFrom = ((.volumesFrom // [])
+            | if any(.sourceContainer == $sc) then . else . + [{sourceContainer:$sc, readOnly:true}] end)
+        | .linuxParameters.capabilities.add = ((.linuxParameters.capabilities.add // [])
+            | if index("SYS_PTRACE") then . else . + ["SYS_PTRACE"] end)
+        | .environment = ((.environment // [])
+            | map(select(.name != "SYSDIG_SIDECAR" and .name != "SYSDIG_PRIORITY"))
+            + [{name:"SYSDIG_SIDECAR", value:"auto"}, {name:"SYSDIG_PRIORITY", value:$prio}]
+            | merge_env($wenv))
+      else . end)
+  | if (.containerDefinitions | map(.name) | index($sc)) then . else .containerDefinitions += [$sidecar] end
+  | .pidMode = "task"
+  | del(.taskDefinitionArn, .revision, .status, .requiresAttributes, .compatibilities,
+        .registeredAt, .registeredBy, .deregisteredAt)
+' <<<"$JSON") || die "failed to build the instrumented task definition"
+
+# ---------------------------------------------------------------- resource warnings
+TASK_CPU=$(jq -r '.cpu // empty' <<<"$RESULT"); TASK_MEM=$(jq -r '.memory // empty' <<<"$RESULT")
+if [ -n "$TASK_CPU" ] && [ -n "$TASK_MEM" ]; then
+  SUM_CPU=$(jq '[.containerDefinitions[].cpu // 0] | add' <<<"$RESULT")
+  SUM_MEM=$(jq '[.containerDefinitions[].memory // 0] | add' <<<"$RESULT")
+  SUM_RES=$(jq '[.containerDefinitions[].memoryReservation // 0] | add' <<<"$RESULT")
+  if [ -z "$SIDECAR_CPU$SIDECAR_MEM$SIDECAR_MEMRES" ]; then
+    if [ "$PRIORITY" = "security" ]; then
+      log "WARNING: priority is 'security' but the sidecar has no CPU/memory of its own. Sysdig describes"
+      log "         security mode as using dedicated sidecar resources. Consider --sidecar-cpu/--sidecar-memory"
+      log "         and make sure the task size (cpu $TASK_CPU, memory $TASK_MEM MiB) leaves room for it."
+    else
+      log "NOTE: the sidecar has no CPU/memory of its own, so the agent shares the task allocation"
+      log "      (cpu $TASK_CPU, memory $TASK_MEM MiB) with your containers. Check there is headroom."
+    fi
+  fi
+  [ "$SUM_CPU" -le "$TASK_CPU" ] || log "WARNING: container CPU units add up to $SUM_CPU, more than the task cpu $TASK_CPU."
+  [ "$SUM_MEM" -le "$TASK_MEM" ] || log "WARNING: container memory limits add up to $SUM_MEM MiB, more than the task memory $TASK_MEM MiB."
+  [ "$SUM_RES" -le "$TASK_MEM" ] || log "WARNING: container memory reservations add up to $SUM_RES MiB, more than the task memory $TASK_MEM MiB."
+fi
+
+if [ "$DRY_RUN" -eq 1 ]; then
+  DEST="${OUTPUT:-$INPUT}"
+  log "dry run: nothing written (would write to: $DEST)"
+  diff -u --label "before" --label "after" <(jq -S . <<<"$JSON") <(jq -S . <<<"$RESULT") || true
+  exit 0
+fi
+
+if [ -z "$OUTPUT" ]; then
+  [ "$INPUT" != "-" ] || die "no --output given and input is stdin"
+  OUTPUT="$INPUT"
+  if [ "$BACKUP" -eq 1 ]; then cp -p "$INPUT" "$INPUT.bak"; log "backup: $INPUT.bak"; fi
+fi
+
+if [ "$OUTPUT" = "-" ]; then
+  echo "$RESULT"
+else
+  tmp="$(mktemp "${OUTPUT}.XXXXXX")"
+  echo "$RESULT" > "$tmp"
+  mv "$tmp" "$OUTPUT"
+  log "wrote $OUTPUT"
+fi

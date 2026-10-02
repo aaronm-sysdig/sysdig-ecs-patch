@@ -1,0 +1,22 @@
+--- original
++++ patched
+@@ -43,7 +43,7 @@
+     },
+     {
+       "command": [
+-        "/usr/bin/event-generator",
++        "/bin/event-generator",
+         "run",
+         "syscall.RunShellUntrusted",
+         "--loop",
+@@ -61,6 +61,10 @@
+         {
+           "name": "SYSDIG_LOGGING",
+           "value": "info"
++        },
++        {
++          "name": "SYSDIG_PRIORITY",
++          "value": "availability"
+         },
+         {
+           "name": "SYSDIG_SIDECAR",

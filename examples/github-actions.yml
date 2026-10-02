@@ -1,0 +1,87 @@
+# Example GitHub Actions workflow: build an image, add Sysdig instrumentation to the
+# task definition, deploy to ECS Fargate.
+#
+# NOT run in a real pipeline yet. Written from the documented inputs of the
+# aws-actions/* actions; check versions and inputs before using.
+#
+# Assumes:
+#   - sysdig-ecs-patch is committed at tools/sysdig-ecs-patch
+#   - the repo has .aws/task-definition.json with a placeholder image for $CONTAINER_NAME,
+#     and NO entryPoint/command if the image bakes them in
+#   - repo variables AWS_ROLE_ARN and SYSDIG_SECRET_ARN (Secrets Manager/SSM ARN holding
+#     the Sysdig access key; the task execution role must be able to read it)
+name: deploy
+on:
+  push:
+    branches: [main]
+
+permissions:
+  id-token: write   # OIDC to AWS
+  contents: read
+
+env:
+  AWS_REGION: ap-southeast-2
+  ECR_REPOSITORY: my-app
+  ECS_CLUSTER: my-cluster
+  ECS_SERVICE: my-service
+  CONTAINER_NAME: my-app
+  SYSDIG_COLLECTOR: ingest.au1.sysdig.com
+  # Pin the agent version (or point at your internal mirror)
+  SYSDIG_AGENT_IMAGE: quay.io/sysdig/workload-agent:6.3.0
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest   # has aws cli, jq, curl preinstalled
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - id: ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Build and push image
+        id: build
+        run: |
+          IMAGE="${{ steps.ecr.outputs.registry }}/${ECR_REPOSITORY}:${GITHUB_SHA}"
+          docker build -t "$IMAGE" .
+          docker push "$IMAGE"
+          echo "image=$IMAGE" >> "$GITHUB_OUTPUT"
+
+      # The image name must be real BEFORE the Sysdig step, because the tool reads the
+      # image's ENTRYPOINT/CMD from the registry.
+      - id: render
+        uses: aws-actions/amazon-ecs-render-task-definition@v1
+        with:
+          task-definition: .aws/task-definition.json
+          container-name: ${{ env.CONTAINER_NAME }}
+          image: ${{ steps.build.outputs.image }}
+
+      - name: Add Sysdig instrumentation
+        run: |
+          chmod +x tools/sysdig-ecs-patch
+          # -m ecr needs only the aws cli, curl and jq. Use -m skopeo/crane for non-ECR images.
+          tools/sysdig-ecs-patch \
+            -i "${{ steps.render.outputs.task-definition }}" \
+            -o taskdef-sysdig.json \
+            -m ecr \
+            --collector "$SYSDIG_COLLECTOR" \
+            --access-key-secret-arn "${{ vars.SYSDIG_SECRET_ARN }}" \
+            --workload-agent-image "$SYSDIG_AGENT_IMAGE" \
+            --priority availability
+          # Look at what changed in the job log
+          tools/sysdig-ecs-patch -i "${{ steps.render.outputs.task-definition }}" \
+            --dry-run -m ecr \
+            --collector "$SYSDIG_COLLECTOR" \
+            --access-key-secret-arn "${{ vars.SYSDIG_SECRET_ARN }}" \
+            --workload-agent-image "$SYSDIG_AGENT_IMAGE" || true
+
+      - uses: aws-actions/amazon-ecs-deploy-task-definition@v2
+        with:
+          task-definition: taskdef-sysdig.json
+          cluster: ${{ env.ECS_CLUSTER }}
+          service: ${{ env.ECS_SERVICE }}
+          wait-for-service-stability: true

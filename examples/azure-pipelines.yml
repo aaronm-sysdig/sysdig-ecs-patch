@@ -1,0 +1,80 @@
+# Example Azure DevOps pipeline: build an image, add Sysdig instrumentation to the
+# task definition, register it and update the ECS service.
+#
+# NOT run in a real pipeline yet. Written from the documented inputs of the
+# AWS Toolkit for Azure DevOps (AWSShellScript@1); check the task version and inputs.
+#
+# Assumes:
+#   - an AWS service connection named aws-service-connection
+#   - sysdig-ecs-patch is committed at tools/sysdig-ecs-patch
+#   - taskdef.json in the repo uses the literal text IMAGE_PLACEHOLDER as the image of
+#     the workload container
+#   - variables sysdigSecretArn (Secrets Manager/SSM ARN of the Sysdig access key)
+trigger:
+  branches:
+    include: [main]
+
+pool:
+  vmImage: ubuntu-latest   # has aws cli, jq, curl preinstalled
+
+variables:
+  awsRegion: ap-southeast-2
+  ecrRepo: my-app
+  ecsCluster: my-cluster
+  ecsService: my-service
+  sysdigCollector: ingest.au1.sysdig.com
+  # Pin the agent version (or point at your internal mirror)
+  sysdigAgentImage: quay.io/sysdig/workload-agent:6.3.0
+
+steps:
+  - checkout: self
+
+  - task: AWSShellScript@1
+    displayName: Build and push image
+    inputs:
+      awsCredentials: aws-service-connection
+      regionName: $(awsRegion)
+      scriptType: inline
+      inlineScript: |
+        set -euo pipefail
+        REGISTRY="$(aws sts get-caller-identity --query Account --output text).dkr.ecr.$(awsRegion).amazonaws.com"
+        aws ecr get-login-password | docker login --username AWS --password-stdin "$REGISTRY"
+        IMAGE="$REGISTRY/$(ecrRepo):$(Build.BuildId)"
+        docker build -t "$IMAGE" .
+        docker push "$IMAGE"
+        echo "##vso[task.setvariable variable=imageUri]$IMAGE"
+
+  # The image name must be real BEFORE the Sysdig step, because the tool reads the
+  # image's ENTRYPOINT/CMD from the registry.
+  - bash: sed -i "s|IMAGE_PLACEHOLDER|$(imageUri)|g" taskdef.json
+    displayName: Substitute image into task definition
+
+  - task: AWSShellScript@1
+    displayName: Add Sysdig instrumentation
+    inputs:
+      awsCredentials: aws-service-connection
+      regionName: $(awsRegion)
+      scriptType: inline
+      inlineScript: |
+        set -euo pipefail
+        chmod +x tools/sysdig-ecs-patch
+        # -m ecr needs only the aws cli, curl and jq. Use -m skopeo/crane for non-ECR images.
+        tools/sysdig-ecs-patch \
+          -i taskdef.json -o taskdef-sysdig.json -m ecr \
+          --collector "$(sysdigCollector)" \
+          --access-key-secret-arn "$(sysdigSecretArn)" \
+          --workload-agent-image "$(sysdigAgentImage)" \
+          --priority availability
+
+  - task: AWSShellScript@1
+    displayName: Register task definition and update service
+    inputs:
+      awsCredentials: aws-service-connection
+      regionName: $(awsRegion)
+      scriptType: inline
+      inlineScript: |
+        set -euo pipefail
+        ARN=$(aws ecs register-task-definition --cli-input-json file://taskdef-sysdig.json \
+              --query taskDefinition.taskDefinitionArn --output text)
+        aws ecs update-service --cluster "$(ecsCluster)" --service "$(ecsService)" --task-definition "$ARN"
+        aws ecs wait services-stable --cluster "$(ecsCluster)" --services "$(ecsService)"
