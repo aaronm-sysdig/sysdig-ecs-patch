@@ -121,6 +121,12 @@ check "multi-line sidecar env value kept intact" "$(jq -r '.containerDefinitions
 OUT=$($P -i "$T/in.json" -m "$M" "${A[@]}" --sidecar-env SYSDIG_EXTRA_CONF= -o - 2>/dev/null)
 check "empty env value allowed" "$(jq -c '.containerDefinitions[1].environment[]|select(.name=="SYSDIG_EXTRA_CONF").value' <<<"$OUT")" '""'
 
+# 17c logging note: shown when the sidecar is added with no log group, not otherwise
+W=$($P -i "$T/in.json" -m "$M" "${A[@]}" -o - 2>&1 >/dev/null)
+case "$W" in *"no --log-group given"*) ok "note: sidecar logs not captured without --log-group" ;; *) bad "note: sidecar logs not captured without --log-group" ;; esac
+W=$($P -i "$T/in.json" -m "$M" "${A[@]}" --log-group /ecs/x --log-region ap-southeast-2 -o - 2>&1 >/dev/null)
+case "$W" in *"no --log-group given"*) bad "no note when --log-group is given" ;; *) ok "no note when --log-group is given" ;; esac
+
 # 18 log group and stream prefix
 OUT=$($P -i "$T/in.json" -m "$M" "${A[@]}" --log-group /ecs/x --log-region ap-southeast-2 --log-stream-prefix mine -o - 2>/dev/null)
 check "log group + prefix" "$(jq -c '.containerDefinitions[1].logConfiguration.options|[.["awslogs-group"],.["awslogs-stream-prefix"]]' <<<"$OUT")" '["/ecs/x","mine"]'

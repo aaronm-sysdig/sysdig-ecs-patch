@@ -480,6 +480,15 @@ RESULT=$(jq \
         .registeredAt, .registeredBy, .deregisteredAt)
 ' <<<"$JSON") || die "failed to build the instrumented task definition"
 
+# ---------------------------------------------------------------- logging note
+SIDECAR_WAS_PRESENT=$(jq --arg sc "$SIDECAR_NAME" '[.containerDefinitions[].name] | index($sc) != null' <<<"$JSON")
+if [ -z "$LOG_GROUP" ] && [ "$SIDECAR_WAS_PRESENT" = "false" ]; then
+  log "NOTE: no --log-group given, so the $SIDECAR_NAME sidecar has no log configuration and"
+  log "      the agent's logs will not be captured anywhere. (The Sysdig launcher lines in the"
+  log "      workload's own log stream come from the instrument entrypoint, not from the agent.)"
+  log "      Use --log-group (and --log-region) to capture them."
+fi
+
 # ---------------------------------------------------------------- resource warnings
 TASK_CPU=$(jq -r '.cpu // empty' <<<"$RESULT"); TASK_MEM=$(jq -r '.memory // empty' <<<"$RESULT")
 if [ -n "$TASK_CPU" ] && [ -n "$TASK_MEM" ]; then

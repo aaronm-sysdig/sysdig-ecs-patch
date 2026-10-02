@@ -19,7 +19,7 @@ method you pick.
 
 You need only `bash` and `jq`.
 
-    ./test-offline.sh                      # 49 checks + a golden-file test, fully offline
+    ./test-offline.sh                      # 51 checks + a golden-file test, fully offline
 
     # Patch the sample task definition yourself. The sample image's config is not
     # reachable offline, so give the tool both fields explicitly (no lookup needed):
@@ -121,9 +121,10 @@ All of these are covered by `./test-offline.sh`.
 - `--log-group`, `--log-region`, `--log-stream-prefix` send the sidecar's logs to
   CloudWatch (prefix defaults to `sysdig`).
 - `--dry-run` / `-n` prints a diff and writes nothing (no file, no backup).
-- Warnings (stderr, never fatal): sidecar has no resources of its own; security
-  mode with no sidecar resources; container CPU/memory adding up to more than the
-  task-level size.
+- Notes and warnings (stderr, never fatal): the sidecar has no log configuration
+  (no `--log-group`, so the agent's logs are not captured); the sidecar has no
+  resources of its own; security mode with no sidecar resources; container
+  CPU/memory adding up to more than the task-level size.
 
 ## pidMode
 
@@ -199,11 +200,11 @@ Decided with the field team; revisit only if a customer needs it.
 
 | Script | Needs | What it does |
 |---|---|---|
-| `./test-offline.sh` | bash, jq | Stub skopeo with canned image configs. Golden test (`examples/event-generator/vanilla.json` must produce `patched.json`), the full 49-check suite, and a CMD-only image case. |
-| `./test.sh IMAGE SECRET_ARN [METHOD]` | the tool for METHOD | The same 49 checks against a real image. IMAGE needs an ENTRYPOINT or CMD. SECRET_ARN can be any ARN-shaped string. |
+| `./test-offline.sh` | bash, jq | Stub skopeo with canned image configs. Golden test (`examples/event-generator/vanilla.json` must produce `patched.json`), the full 51-check suite, and a CMD-only image case. |
+| `./test.sh IMAGE SECRET_ARN [METHOD]` | the tool for METHOD | The same 51 checks against a real image. IMAGE needs an ENTRYPOINT or CMD. SECRET_ARN can be any ARN-shaped string. |
 | `./linux-test.sh` | Docker | Runs `test.sh` inside an Ubuntu container (installs jq, skopeo, curl, AWS CLI v2). Needs AWS credentials and an ECR image. |
 
-Results so far (49/49 each unless noted):
+Results so far (51/51 each unless noted):
 
 | Environment | jq | Result |
 |---|---|---|
